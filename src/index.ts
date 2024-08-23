@@ -1,92 +1,164 @@
-import { createServer } from 'http';
-import { CloudClient } from './cloud';
-var url = require('url');
+const express = require("express");
 
-s = createServer(function (a, b) {
-    b.writeHead('200 OK');
+import { Network, Disk, Task, CloudClient } from "./cloud";
+import { Request, Response } from "express";
 
-    if (a.url = '/list') {
-        tasks = [];
-        x=+0;
-        while (cl.listTasks(x).items.length > 0) {
-            tasks.push(...cl.listTasks(x).items);
-            x = x+1;
-        }
-        var o:any[]=[];
-        for (var i=0;i<tasks.length;i++){
-            var f=0;
-            for(var j=0;j<o.length;j++){
-                if(tasks[i].id==o[j].id){
-                    f=1;
-                }
-            }
-            if(!f){
-                o.push(tasks[i]);
-            }
-        }
-        b.write(JSON.stringify(o));
-    } if (a.url == '/create') {
-        if (cl.listTasks(x).items.length > max) {
-            b.writeHead(429);
-            b.write('Too many tasks created, cannot create any more.');
-        }
-        disk = cl.createDisk({ byteSize: +url.parse(a.url, true).query.diskSize });
-        x=0;
-        // don't remove or fail
-        while(!x){try{network = cl.createNetwork(); x=1} catch {}}
-        task = cl.createTask({
+interface BatchItems {
+  items: any[];
+  nextToken: number;
+}
 
+const app = express();
+const port = 8081;
 
-            dockerImage: 'ubuntu:latest',
-            networkId: network.id,
+const client = new CloudClient();
 
-            diskId: disk.id,
-        });
-    } if (a.url == '/destroy') {
-        cl.destroyTask(url.parse(a.url, true).query.id);
+const GC_INTERVAL = 10000;
+const MAX_TASKS = 100;
+const ERROR_500_MSG =
+  "The server encountered an unexpected condition that prevented it from fulfilling the request";
+
+async function fetchAllItems(itemType: string) {
+  try {
+    let allItems: Network[] | Disk[] | Task[] = [];
+    let currentBatch: BatchItems = { items: [], nextToken: 0 };
+
+    // Fetch tasks items there are no more pages
+    while (true) {
+      switch (itemType) {
+        case "networks":
+          currentBatch = await client.listNetworks(currentBatch.nextToken);
+          break;
+        case "disks":
+          currentBatch = await client.listDisks(currentBatch.nextToken);
+          break;
+        case "tasks":
+          currentBatch = await client.listTasks(currentBatch.nextToken);
+          break;
+        default:
+          // Nothing
+          break;
+      }
+      // No results have returned. Reached the end of the store for specific item.
+      if (!currentBatch.items.length) {
+        break;
+      }
+      allItems.push(...currentBatch.items);
+    }
+    return allItems;
+  } catch (error) {
+    console.log("Error retreiving items:", error);
+    // Empty for error. Don't want to send half baked results.
+    return [];
+  }
+}
+
+async function GarbageCollector() {
+  try {
+    const allTasks = (await fetchAllItems("tasks")) as Task[];
+
+    const usedDiskIds = allTasks.map((task) => task.diskId);
+    const usedNetworkIds = allTasks.map((task) => task.networkId);
+
+    const allDisks = (await fetchAllItems("disks")) as Disk[];
+    const allNetworks = (await fetchAllItems("networks")) as Network[];
+
+    // Destroy unused disks
+    allDisks.forEach(async (disk) => {
+      if (!usedDiskIds.includes(disk.id)) {
+        await client.destroyDisk(disk.id);
+      }
+    });
+
+    // Destroy unused networks
+    allNetworks.forEach(async (network) => {
+      if (!usedNetworkIds.includes(network.id)) {
+        await client.destroyNetwork(network.id);
+      }
+    });
+  } catch (error) {
+    console.log("Error during garbage collection", error);
+  }
+}
+
+app.post("/task", async (req: Request, res: Response) => {
+  const diskSize = req.query.diskSize;
+  if (!diskSize) {
+    return res.status(400).send("Query param 'diskSize' is required");
+  }
+  try {
+    const allTasks = (await fetchAllItems("tasks")) as Task[];
+    if (allTasks.length >= MAX_TASKS) {
+      return res
+        .status(429)
+        .send("Too many tasks created, cannot create any more.");
     }
 
-    b.end();
+    const createdDiskId = await client.createDisk({
+      byteSize: Number(diskSize),
+    });
 
-    // GC resources
-    setInterval(function () {
-        var y:string[] =[];
-        var z:string[]=[];
-        for (x of cl.listTasks().items) {
-            y.push(x.diskId);
-        }
-        (cl.listTasks() as any).forEach(function (u: any){z.push(u.networkId)});
-        for (x of cl.listDisks().items) {
-            cond=0;
-            for (var a of y) {
-                if (a==x.id){cond=1}
-            }
-            if(!cond){
-                cl.destroyDisk(x.id);
-            }
-        }
-        for (x of cl.listNetworks().items) {
-            cond=0;
-            for (var a of y) {
-                if (a==x.id){cond=1}
-            }
-            if(!cond){
-                cl.destroyDisk(x.id);
-            }
-        }
-    }, 10000);
+    const createdNetworkId = await client.createNetwork();
+
+    const createdTaskId: string = await client.createTask({
+      dockerImage: "ubuntu:latest",
+      networkId: createdNetworkId,
+      diskId: createdDiskId,
+    });
+
+    res.status(200).send({ taskId: `${createdTaskId}` });
+  } catch (error) {
+    console.log("Error during task creation:", error);
+    return res.status(500).send(ERROR_500_MSG);
+  }
 });
 
-s.listen(8081, function () {
-    console.log('started');
+app.get("/tasks", async (req: Request, res: Response) => {
+  try {
+    const allTasks = (await fetchAllItems("tasks")) as Task[];
+    res.status(200).send(allTasks);
+  } catch (error) {
+    console.log("Error retreiving tasks:", error);
+    res.status(500).send(ERROR_500_MSG);
+  }
 });
 
-var s: any;
-var cl = new CloudClient();
-var disk: any;
-var network: any;
-var task: any;
-var tasks: any;
-var x: any;
-var cond: any;
-var max=100;
+app.get("/disks", async (req: Request, res: Response) => {
+  try {
+    const allTasks = (await fetchAllItems("disks")) as Disk[];
+    res.status(200).send(allTasks);
+  } catch (error) {
+    console.log("Error retreiving disks:", error);
+    res.status(500).send(ERROR_500_MSG);
+  }
+});
+
+app.get("/networks", async (req: Request, res: Response) => {
+  try {
+    const allTasks = (await fetchAllItems("networks")) as Network[];
+    res.status(200).send(allTasks);
+  } catch (error) {
+    console.log("Error retreiving networks:", error);
+    res.status(500).send(ERROR_500_MSG);
+  }
+});
+
+app.delete("/task", async (req: Request, res: Response) => {
+  const taskId = req.query.id;
+  if (!taskId) {
+    res.status(400).send("Query param 'id' is required");
+  }
+  try {
+    await client.destroyTask(String(taskId));
+    res.status(200).send("Task deleted successfully");
+  } catch (error) {
+    console.log(`Error while trying to destroy task with Id ${taskId}`, error);
+    res.status(500).send(`Failed to delete task with Id ${taskId}`);
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Toy app listening on port ${port}`);
+});
+
+setInterval(GarbageCollector, GC_INTERVAL);
